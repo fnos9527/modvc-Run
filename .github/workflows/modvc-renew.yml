@@ -1,0 +1,46 @@
+name: ModVC Free Tier Auto Renew
+
+on:
+  schedule:
+    # 每天 UTC 3:00（北京时间 11:00）执行一次，可按需修改
+    # 如果 GitHub 原生 cron 不准时，可改用 cron-job.org 调用 workflow_dispatch 触发
+    - cron: '0 3 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 安装依赖
+        run: npm install
+
+      - name: 安装 Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: 执行续期脚本
+        env:
+          MODVC_COOKIES: ${{ secrets.MODVC_COOKIES }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: node renew.js
+
+      - name: 上传截图（用于调试）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: |
+            before.png
+            after.png
+            error.png
+          if-no-files-found: ignore
