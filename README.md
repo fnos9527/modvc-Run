@@ -1,1 +1,6 @@
-# modvc-Run
+# modvc-Run    
+MODVC_COOKIES
+
+TG_TOKEN
+
+TG_CHAT_ID
