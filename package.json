@@ -1,0 +1,12 @@
+{
+  "name": "modvc-auto-renew",
+  "version": "1.0.0",
+  "private": true,
+  "description": "自动登录 panel.modvc.org 并点击 Renew Free Tier 续期，结果通过 Telegram 通知",
+  "scripts": {
+    "start": "node renew.js"
+  },
+  "dependencies": {
+    "playwright": "^1.47.0"
+  }
+}
