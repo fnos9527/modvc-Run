@@ -1,18 +1,22 @@
 /**
  * ModVC (panel.modvc.org) Free Tier 自动续期脚本
  *
- * 鉴权方式：该站点用 Google 账号登录（Firebase Auth），登录态主要存放在浏览器的
- * IndexedDB 里（而不是 Cookie 或 localStorage）。所以这里：
+ * 鉴权方式：站点用 Google 账号登录（Firebase Auth），登录态主要存放在浏览器的
+ * IndexedDB 里。所以这里：
  *   1. 用 Playwright storageState 还原 Cookie + localStorage
  *   2. 手动把 sessionStorage 写回去
- *   3. 手动把 IndexedDB 的数据库/表/记录原样写回去（这是关键）
+ *   3. 手动把 IndexedDB 的数据库/表/记录原样写回去（这是关键，已验证有效）
+ *
+ * 到期时间不再从页面文字里抠（页面布局容易变化、不可靠），改为直接抓
+ * /tier、/hosting/orders 这两个接口返回的 JSON，在里面自动找形如
+ * expiresAt / until / renewUntil 这类字段。
  *
  * 流程：
  * 1. 还原登录状态（MODVC_STATE）
  * 2. 打开页面 -> 还原 IndexedDB -> 重新加载页面，确认进入了仪表盘
- * 3. 读取 "FREE TIER until" 的到期时间（续期前）
+ * 3. 记录续期前的到期时间（来自 API JSON，文本提取作为兜底参考）
  * 4. 点击 "Renew Free Tier" 按钮
- * 5. 刷新页面，再次读取到期时间（续期后），对比是否有变化
+ * 5. 刷新页面，记录续期后的到期时间，对比是否有变化
  * 6. 通过 Telegram 机器人发送结果通知（含截图）
  * 7. 如果登录状态已失效（进不去仪表盘），立即发送告警通知
  */
@@ -28,8 +32,8 @@ const STATE_RAW = process.env.MODVC_STATE;
 
 // ------------------------- 工具函数 -------------------------
 
-/** 从页面正文中提取 "FREE TIER until xxxx/x/x" 这样的日期 */
-async function extractUntilDate(page) {
+/** 从页面正文里提取 "FREE TIER until xxxx/x/x" 这样的日期，仅作为兜底参考 */
+async function extractUntilDateFromText(page) {
   const text = await page.evaluate(() => document.body.innerText);
 
   let match = text.match(/until\s*\n?\s*(\d{4}\/\d{1,2}\/\d{1,2})/i);
@@ -74,11 +78,10 @@ function tryDecodeJwt(token) {
   }
 }
 
-/** 深度遍历整个导出的 state（包括 IndexedDB 记录），找 JWT 和过期时间字段，打印诊断信息 */
+/** 深度遍历整个导出的 state，找 JWT 和过期时间字段，打印诊断信息 */
 function logTokenDiagnostics(state) {
   const jwtPattern = /^[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}$/;
   let jwtFound = false;
-  let expFound = false;
 
   function walk(node, path) {
     if (node == null) return;
@@ -87,12 +90,9 @@ function logTokenDiagnostics(state) {
         jwtFound = true;
         const payload = tryDecodeJwt(node);
         console.log(`[Token检测] 在 ${path} 发现一个 JWT`);
-        if (payload) {
-          console.log(`[Token检测] payload:`, JSON.stringify(payload));
-          if (payload.exp) {
-            const expDate = new Date(payload.exp * 1000);
-            console.log(`[Token检测] exp(秒级): ${expDate.toISOString()} | 是否已过期: ${expDate < new Date()}`);
-          }
+        if (payload && payload.exp) {
+          const expDate = new Date(payload.exp * 1000);
+          console.log(`[Token检测] exp: ${expDate.toISOString()} | 是否已过期: ${expDate < new Date()}`);
         }
       }
       return;
@@ -103,25 +103,62 @@ function logTokenDiagnostics(state) {
     }
     if (typeof node === 'object') {
       for (const key of Object.keys(node)) {
-        if (/expir/i.test(key) && (typeof node[key] === 'number' || typeof node[key] === 'string')) {
-          expFound = true;
-          const raw = node[key];
-          const num = Number(raw);
-          const expDate = Number.isFinite(num) ? new Date(num > 1e12 ? num : num * 1000) : null;
-          console.log(
-            `[Token检测] 在 ${path}.${key} 发现过期时间字段，原始值: ${raw}` +
-              (expDate ? ` | 解析为: ${expDate.toISOString()} | 是否已过期: ${expDate < new Date()}` : '')
-          );
-        }
         walk(node[key], `${path}.${key}`);
       }
     }
   }
 
   walk(state, 'MODVC_STATE');
-
   if (!jwtFound) console.log('[Token检测] 没有发现明显的 JWT 字符串');
-  if (!expFound) console.log('[Token检测] 没有发现明显的过期时间字段（key 包含 expir）');
+}
+
+/** 在任意 JSON 对象里深度查找形如 expiresAt / until / renewUntil 的日期字段 */
+function findDateCandidates(obj, path = '') {
+  const candidates = [];
+  function walk(node, p) {
+    if (node == null) return;
+    if (Array.isArray(node)) {
+      node.forEach((item, i) => walk(item, `${p}[${i}]`));
+      return;
+    }
+    if (typeof node === 'object') {
+      for (const key of Object.keys(node)) {
+        const val = node[key];
+        const keyLooksRelevant = /expir|until|renew|valid.?(till|thru)|tier.*date/i.test(key);
+        if (keyLooksRelevant) {
+          if (typeof val === 'string') {
+            const d = new Date(val.replace(/\//g, '-'));
+            if (!isNaN(d.getTime()) && d.getFullYear() > 2020 && d.getFullYear() < 2035) {
+              candidates.push({ path: `${p}.${key}`, raw: val, date: d });
+            }
+          } else if (typeof val === 'number') {
+            const ms = val > 1e12 ? val : val * 1000;
+            const d = new Date(ms);
+            if (d.getFullYear() > 2020 && d.getFullYear() < 2035) {
+              candidates.push({ path: `${p}.${key}`, raw: val, date: d });
+            }
+          }
+        }
+        walk(val, `${p}.${key}`);
+      }
+    }
+  }
+  walk(obj, path);
+  return candidates;
+}
+
+/** 从多个接口返回的 JSON 里挑出最可能是「到期时间」的那个字段 */
+function pickExpiryDate(jsons) {
+  let all = [];
+  jsons.forEach((json, idx) => {
+    if (!json) return;
+    all = all.concat(findDateCandidates(json).map((c) => ({ ...c, source: idx })));
+  });
+  if (all.length === 0) return null;
+
+  const score = (c) => (/expir/i.test(c.path) ? 3 : /until/i.test(c.path) ? 2 : /renew/i.test(c.path) ? 1 : 0);
+  all.sort((a, b) => score(b) - score(a));
+  return { ...all[0], all };
 }
 
 /**
@@ -147,9 +184,7 @@ async function restoreIndexedDBInPage(dump) {
               for (const idx of store.indexes || []) {
                 try {
                   os.createIndex(idx.name, idx.keyPath, { unique: idx.unique, multiEntry: idx.multiEntry });
-                } catch (e) {
-                  /* 索引创建失败忽略 */
-                }
+                } catch (e) {}
               }
             }
           }
@@ -174,9 +209,7 @@ async function restoreIndexedDBInPage(dump) {
                 os.put(rec.value, rec.key);
               }
               restored++;
-            } catch (e) {
-              /* 单条写入失败忽略，不影响整体 */
-            }
+            } catch (e) {}
           });
           tx.oncomplete = resolve;
           tx.onerror = resolve;
@@ -184,9 +217,7 @@ async function restoreIndexedDBInPage(dump) {
         });
       }
       db.close();
-    } catch (e) {
-      /* 某个数据库还原失败，不影响其它数据库 */
-    }
+    } catch (e) {}
   }
 
   return { ok: true, restored };
@@ -225,6 +256,11 @@ async function sendTelegram(text, screenshotPath) {
   } catch (e) {
     console.error('[TG] 通知发送异常:', e.message);
   }
+}
+
+function formatDate(d) {
+  if (!d) return '未知';
+  return d.toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
 }
 
 // ------------------------- 主流程 -------------------------
@@ -268,28 +304,46 @@ async function sendTelegram(text, screenshotPath) {
         items.forEach(({ name, value }) => {
           window.sessionStorage.setItem(name, value);
         });
-      } catch (e) {
-        /* 忽略注入失败 */
-      }
+      } catch (e) {}
     }, sessionStorageItems);
   }
 
   const page = await context.newPage();
 
+  // ---- 被动抓取 /tier、/hosting/orders 接口的 JSON 响应，留到后面找到期时间用 ----
+  let latestTierJson = null;
+  let latestOrdersJson = null;
+
   page.on('console', (msg) => {
     console.log(`[页面console:${msg.type()}] ${msg.text()}`);
   });
-  page.on('response', (response) => {
+
+  page.on('response', async (response) => {
+    let url;
     try {
-      const url = response.url();
-      if (url.includes('modvc.org')) {
-        const status = response.status();
-        if (status >= 400 || /\/(me|user|auth|login|status|logs|api)/i.test(url)) {
-          console.log(`[网络] ${status} ${url}`);
-        }
-      }
+      url = response.url();
     } catch (e) {
-      /* 忽略 */
+      return;
+    }
+    if (!url.includes('modvc.org')) return;
+
+    const status = response.status();
+    if (status >= 400 || /\/(me|user|auth|login|status|logs|api)/i.test(url)) {
+      console.log(`[网络] ${status} ${url}`);
+    }
+
+    if (status === 200) {
+      try {
+        if (/\/tier(\?|$)/.test(url)) {
+          latestTierJson = await response.json();
+          console.log('[Tier响应]', JSON.stringify(latestTierJson));
+        } else if (/\/hosting\/orders(\?|$)/.test(url)) {
+          latestOrdersJson = await response.json();
+          console.log('[Orders响应]', JSON.stringify(latestOrdersJson));
+        }
+      } catch (e) {
+        /* 不是 JSON 或解析失败，忽略 */
+      }
     }
   });
 
@@ -297,39 +351,17 @@ async function sendTelegram(text, screenshotPath) {
   const afterShot = 'after.png';
 
   try {
-    // ---- 第一次打开页面：此时大概率还是未登录状态，主要目的是站到正确的 origin 上 ----
     await page.goto(TARGET_URL, { waitUntil: 'networkidle', timeout: 60000 });
 
-    // ---- 还原 IndexedDB（Firebase 登录态主要存在这里） ----
     if (Array.isArray(indexedDBDump) && indexedDBDump.length > 0) {
       const restoreResult = await page.evaluate(restoreIndexedDBInPage, indexedDBDump);
       console.log('[调试] IndexedDB 还原结果:', JSON.stringify(restoreResult));
     } else {
-      console.log('[调试] MODVC_STATE 中没有 indexedDB 字段，跳过还原（请确认用的是最新版控制台脚本导出的）');
+      console.log('[调试] MODVC_STATE 中没有 indexedDB 字段，跳过还原');
     }
 
-    // ---- 重新加载页面，让前端的 Firebase SDK 重新读取 IndexedDB 里刚写入的登录态 ----
     await page.reload({ waitUntil: 'networkidle', timeout: 60000 });
 
-    // ---- 诊断：确认实际存储情况 ----
-    const debugStorage = await page.evaluate(async () => {
-      let dbNames = [];
-      try {
-        if ('indexedDB' in window && indexedDB.databases) {
-          const dbs = await indexedDB.databases();
-          dbNames = dbs.map((d) => d.name);
-        }
-      } catch (e) {}
-      return {
-        cookie: document.cookie,
-        localStorageKeys: Object.keys(window.localStorage || {}),
-        sessionStorageKeys: Object.keys(window.sessionStorage || {}),
-        indexedDBNames: dbNames,
-      };
-    });
-    console.log('[调试] 页面实际看到的存储情况:', JSON.stringify(debugStorage));
-
-    // ---- 登录状态有效性检测 ----
     const dashboardOk = await waitForDashboard(page);
     if (!dashboardOk) {
       await page.screenshot({ path: beforeShot, fullPage: true });
@@ -342,18 +374,26 @@ async function sendTelegram(text, screenshotPath) {
       process.exit(1);
     }
 
-    // ---- 续期前：读取到期时间 ----
-    const beforeDate = await extractUntilDate(page);
-    await page.screenshot({ path: beforeShot, fullPage: true });
-    console.log('续期前到期时间:', beforeDate);
+    // 给响应监听器一点缓冲时间，确保 /tier 等请求的回调已经处理完
+    await page.waitForTimeout(1500);
 
-    // ---- 定位并点击 Renew Free Tier 按钮 ----
+    const beforeApiInfo = pickExpiryDate([latestTierJson, latestOrdersJson]);
+    const beforeTextDate = await extractUntilDateFromText(page);
+    console.log(
+      '[调试] 续期前 - API候选:',
+      beforeApiInfo ? `${beforeApiInfo.path} = ${beforeApiInfo.raw} (${formatDate(beforeApiInfo.date)})` : '未找到',
+      '| 文本兜底:',
+      beforeTextDate
+    );
+
+    await page.screenshot({ path: beforeShot, fullPage: true });
+
     const renewBtn = page.getByRole('button', { name: /renew free tier/i }).first();
     const btnVisible = await renewBtn.isVisible().catch(() => false);
 
     if (!btnVisible) {
       await sendTelegram(
-        `⚠️ ModVC 未找到「Renew Free Tier」按钮（可能页面结构变化、已升级为 Pro，或暂不在可续期窗口）。\n当前到期时间：${beforeDate || '未提取到'}`,
+        `⚠️ ModVC 未找到「Renew Free Tier」按钮（可能页面结构变化、已升级为 Pro，或暂不在可续期窗口）。`,
         beforeShot
       );
       await browser.close();
@@ -379,37 +419,40 @@ async function sendTelegram(text, screenshotPath) {
       process.exit(1);
     }
 
-    const afterDate = await extractUntilDate(page);
+    await page.waitForTimeout(1500);
+
+    const afterApiInfo = pickExpiryDate([latestTierJson, latestOrdersJson]);
+    const afterTextDate = await extractUntilDateFromText(page);
+    console.log(
+      '[调试] 续期后 - API候选:',
+      afterApiInfo ? `${afterApiInfo.path} = ${afterApiInfo.raw} (${formatDate(afterApiInfo.date)})` : '未找到',
+      '| 文本兜底:',
+      afterTextDate
+    );
+
     await page.screenshot({ path: afterShot, fullPage: true });
-    console.log('续期后到期时间:', afterDate);
 
     let resultMsg;
-    if (beforeDate && afterDate) {
-      const beforeMs = new Date(beforeDate.replace(/\//g, '-')).getTime();
-      const afterMs = new Date(afterDate.replace(/\//g, '-')).getTime();
+    const beforeDate = beforeApiInfo ? beforeApiInfo.date : beforeTextDate ? new Date(beforeTextDate.replace(/\//g, '-')) : null;
+    const afterDate = afterApiInfo ? afterApiInfo.date : afterTextDate ? new Date(afterTextDate.replace(/\//g, '-')) : null;
 
-      if (afterMs > beforeMs) {
-        const diffDays = Math.round((afterMs - beforeMs) / 86400000);
+    if (beforeDate && afterDate) {
+      const diffDays = Math.round((afterDate.getTime() - beforeDate.getTime()) / 86400000);
+      if (afterDate.getTime() > beforeDate.getTime()) {
         resultMsg =
           `✅ ModVC 续期成功！\n` +
-          `续期前到期时间：${beforeDate}\n` +
-          `续期后到期时间：${afterDate}\n` +
+          `续期前到期时间：${formatDate(beforeDate)}\n` +
+          `续期后到期时间：${formatDate(afterDate)}\n` +
           `增加了约 ${diffDays} 天`;
-      } else if (afterMs === beforeMs) {
-        resultMsg =
-          `ℹ️ ModVC 续期未生效（到期时间没有变化）。\n` +
-          `到期时间：${beforeDate}\n` +
-          `可能尚未到可续期时间窗口，或按钮点击未真正生效，请查看截图核实。`;
+      } else if (afterDate.getTime() === beforeDate.getTime()) {
+        resultMsg = `ℹ️ ModVC 续期未生效（到期时间没有变化）。\n到期时间：${formatDate(beforeDate)}\n请查看截图核实。`;
       } else {
-        resultMsg =
-          `⚠️ ModVC 续期后到期时间反而变小，请人工核实。\n` +
-          `续期前：${beforeDate}\n续期后：${afterDate}`;
+        resultMsg = `⚠️ ModVC 续期后到期时间反而变小，请人工核实。\n续期前：${formatDate(beforeDate)}\n续期后：${formatDate(afterDate)}`;
       }
     } else {
       resultMsg =
-        `⚠️ ModVC 续期流程已执行，但未能正确提取到期时间。\n` +
-        `续期前：${beforeDate || '未提取到'}\n续期后：${afterDate || '未提取到'}\n` +
-        `请查看截图核实，可能是页面文案有变化，需要调整提取规则。`;
+        `⚠️ ModVC 续期流程已执行（点击了按钮，接口已调用），但未能从 /tier、/hosting/orders 接口或页面文字里提取到到期时间。\n` +
+        `请查看 Actions 日志里的 [Tier响应] / [Orders响应] 内容，找到实际的日期字段名后告诉我，我再精确调整提取规则。`;
     }
 
     await sendTelegram(resultMsg, afterShot);
