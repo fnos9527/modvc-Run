@@ -2,9 +2,9 @@ name: ModVC Free Tier Auto Renew
 
 on:
   schedule:
-    # 每天 UTC 3:00（北京时间 11:00）执行一次，可按需修改
+    # 每天北京时间 05:00 执行（UTC 21:00
     # 如果 GitHub 原生 cron 不准时，可改用 cron-job.org 调用 workflow_dispatch 触发
-    - cron: '0 3 * * *'
+    - cron: '0 21 * * *'
   workflow_dispatch: {}
 
 jobs:
