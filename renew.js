@@ -45,6 +45,51 @@ async function extractUntilDate(page) {
   return null;
 }
 
+/** 尝试 base64url 解码 JWT 的 payload 部分 */
+function tryDecodeJwt(token) {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const padded = b64 + '='.repeat((4 - (b64.length % 4)) % 4);
+    return JSON.parse(Buffer.from(padded, 'base64').toString('utf8'));
+  } catch (e) {
+    return null;
+  }
+}
+
+/** 在 storageState 的 cookies / localStorage / sessionStorage 里找看起来像 JWT 的值，打印过期时间 */
+function logJwtExpiryInfo(storageState, sessionStorageItems) {
+  const candidates = [];
+  (storageState.cookies || []).forEach((c) => candidates.push(c.value));
+  (storageState.origins || []).forEach((o) => (o.localStorage || []).forEach((i) => candidates.push(i.value)));
+  (sessionStorageItems || []).forEach((i) => candidates.push(i.value));
+
+  const jwtPattern = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+  let found = false;
+
+  candidates.forEach((val) => {
+    if (typeof val === 'string' && jwtPattern.test(val)) {
+      const payload = tryDecodeJwt(val);
+      if (payload) {
+        found = true;
+        console.log('[JWT检测] 找到一个 token，payload:', JSON.stringify(payload));
+        if (payload.exp) {
+          const expDate = new Date(payload.exp * 1000);
+          const now = new Date();
+          console.log(
+            `[JWT检测] 过期时间: ${expDate.toISOString()} | 当前时间: ${now.toISOString()} | 是否已过期: ${expDate < now}`
+          );
+        }
+      }
+    }
+  });
+
+  if (!found) {
+    console.log('[JWT检测] MODVC_STATE 中没有发现明显的 JWT（可能存放方式不同，或值被截断了）');
+  }
+}
+
 /** 等待仪表盘真正加载出来（看到 FREE TIER / Renew Free Tier 等关键字） */
 async function waitForDashboard(page, timeout = 15000) {
   try {
@@ -123,6 +168,9 @@ async function sendTelegram(text, screenshotPath) {
     process.exit(1);
   }
 
+  // ---- 诊断：检查导出的 token 是否已经过期 ----
+  logJwtExpiryInfo(storageState, sessionStorageItems);
+
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({
     storageState,
@@ -144,11 +192,37 @@ async function sendTelegram(text, screenshotPath) {
 
   const page = await context.newPage();
 
+  // ---- 诊断：打印页面自身的 console 输出，以及关键网络请求的状态码 ----
+  page.on('console', (msg) => {
+    console.log(`[页面console:${msg.type()}] ${msg.text()}`);
+  });
+  page.on('response', (response) => {
+    try {
+      const url = response.url();
+      if (url.includes('modvc.org')) {
+        const status = response.status();
+        if (status >= 400 || /\/(me|user|auth|login|status|logs|api)/i.test(url)) {
+          console.log(`[网络] ${status} ${url}`);
+        }
+      }
+    } catch (e) {
+      /* 忽略 */
+    }
+  });
+
   const beforeShot = 'before.png';
   const afterShot = 'after.png';
 
   try {
     await page.goto(TARGET_URL, { waitUntil: 'networkidle', timeout: 60000 });
+
+    // ---- 诊断：确认 storageState / sessionStorage 是否真的落地到了页面里 ----
+    const debugStorage = await page.evaluate(() => ({
+      cookie: document.cookie,
+      localStorageKeys: Object.keys(window.localStorage || {}),
+      sessionStorageKeys: Object.keys(window.sessionStorage || {}),
+    }));
+    console.log('[调试] 页面实际看到的存储情况:', JSON.stringify(debugStorage));
 
     // ---- 登录状态有效性检测 ----
     const dashboardOk = await waitForDashboard(page);
