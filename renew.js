@@ -1,13 +1,15 @@
 /**
  * ModVC (panel.modvc.org) Free Tier 自动续期脚本
  *
- * 鉴权方式：该站点用的是 localStorage 里存的 JWT（Authorization: Bearer ...），
- * 不是传统 Cookie Session，所以这里用 Playwright 的 storageState 整体还原登录态
- * （Cookie + localStorage），并额外手动注入 sessionStorage（标准 storageState 不含）。
+ * 鉴权方式：该站点用 Google 账号登录（Firebase Auth），登录态主要存放在浏览器的
+ * IndexedDB 里（而不是 Cookie 或 localStorage）。所以这里：
+ *   1. 用 Playwright storageState 还原 Cookie + localStorage
+ *   2. 手动把 sessionStorage 写回去
+ *   3. 手动把 IndexedDB 的数据库/表/记录原样写回去（这是关键）
  *
  * 流程：
  * 1. 还原登录状态（MODVC_STATE）
- * 2. 打开 Overview 页面，确认确实进入了仪表盘（而不是被打回首页/登录页）
+ * 2. 打开页面 -> 还原 IndexedDB -> 重新加载页面，确认进入了仪表盘
  * 3. 读取 "FREE TIER until" 的到期时间（续期前）
  * 4. 点击 "Renew Free Tier" 按钮
  * 5. 刷新页面，再次读取到期时间（续期后），对比是否有变化
@@ -30,11 +32,9 @@ const STATE_RAW = process.env.MODVC_STATE;
 async function extractUntilDate(page) {
   const text = await page.evaluate(() => document.body.innerText);
 
-  // 优先匹配 "until" 紧跟的日期
   let match = text.match(/until\s*\n?\s*(\d{4}\/\d{1,2}\/\d{1,2})/i);
   if (match) return match[1];
 
-  // 兜底：在 "FREE TIER" 附近 120 字符内找日期
   const idx = text.toUpperCase().indexOf('FREE TIER');
   if (idx !== -1) {
     const snippet = text.slice(idx, idx + 120);
@@ -43,6 +43,22 @@ async function extractUntilDate(page) {
   }
 
   return null;
+}
+
+/** 等待仪表盘真正加载出来 */
+async function waitForDashboard(page, timeout = 15000) {
+  try {
+    await page.waitForFunction(
+      () => {
+        const t = document.body.innerText || '';
+        return /free tier/i.test(t) && /renew free tier|runtime|public url/i.test(t);
+      },
+      { timeout }
+    );
+    return true;
+  } catch (e) {
+    return false;
+  }
 }
 
 /** 尝试 base64url 解码 JWT 的 payload 部分 */
@@ -58,52 +74,122 @@ function tryDecodeJwt(token) {
   }
 }
 
-/** 在 storageState 的 cookies / localStorage / sessionStorage 里找看起来像 JWT 的值，打印过期时间 */
-function logJwtExpiryInfo(storageState, sessionStorageItems) {
-  const candidates = [];
-  (storageState.cookies || []).forEach((c) => candidates.push(c.value));
-  (storageState.origins || []).forEach((o) => (o.localStorage || []).forEach((i) => candidates.push(i.value)));
-  (sessionStorageItems || []).forEach((i) => candidates.push(i.value));
+/** 深度遍历整个导出的 state（包括 IndexedDB 记录），找 JWT 和过期时间字段，打印诊断信息 */
+function logTokenDiagnostics(state) {
+  const jwtPattern = /^[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}$/;
+  let jwtFound = false;
+  let expFound = false;
 
-  const jwtPattern = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
-  let found = false;
-
-  candidates.forEach((val) => {
-    if (typeof val === 'string' && jwtPattern.test(val)) {
-      const payload = tryDecodeJwt(val);
-      if (payload) {
-        found = true;
-        console.log('[JWT检测] 找到一个 token，payload:', JSON.stringify(payload));
-        if (payload.exp) {
-          const expDate = new Date(payload.exp * 1000);
-          const now = new Date();
-          console.log(
-            `[JWT检测] 过期时间: ${expDate.toISOString()} | 当前时间: ${now.toISOString()} | 是否已过期: ${expDate < now}`
-          );
+  function walk(node, path) {
+    if (node == null) return;
+    if (typeof node === 'string') {
+      if (jwtPattern.test(node)) {
+        jwtFound = true;
+        const payload = tryDecodeJwt(node);
+        console.log(`[Token检测] 在 ${path} 发现一个 JWT`);
+        if (payload) {
+          console.log(`[Token检测] payload:`, JSON.stringify(payload));
+          if (payload.exp) {
+            const expDate = new Date(payload.exp * 1000);
+            console.log(`[Token检测] exp(秒级): ${expDate.toISOString()} | 是否已过期: ${expDate < new Date()}`);
+          }
         }
       }
+      return;
     }
-  });
-
-  if (!found) {
-    console.log('[JWT检测] MODVC_STATE 中没有发现明显的 JWT（可能存放方式不同，或值被截断了）');
+    if (Array.isArray(node)) {
+      node.forEach((item, i) => walk(item, `${path}[${i}]`));
+      return;
+    }
+    if (typeof node === 'object') {
+      for (const key of Object.keys(node)) {
+        if (/expir/i.test(key) && (typeof node[key] === 'number' || typeof node[key] === 'string')) {
+          expFound = true;
+          const raw = node[key];
+          const num = Number(raw);
+          const expDate = Number.isFinite(num) ? new Date(num > 1e12 ? num : num * 1000) : null;
+          console.log(
+            `[Token检测] 在 ${path}.${key} 发现过期时间字段，原始值: ${raw}` +
+              (expDate ? ` | 解析为: ${expDate.toISOString()} | 是否已过期: ${expDate < new Date()}` : '')
+          );
+        }
+        walk(node[key], `${path}.${key}`);
+      }
+    }
   }
+
+  walk(state, 'MODVC_STATE');
+
+  if (!jwtFound) console.log('[Token检测] 没有发现明显的 JWT 字符串');
+  if (!expFound) console.log('[Token检测] 没有发现明显的过期时间字段（key 包含 expir）');
 }
 
-/** 等待仪表盘真正加载出来（看到 FREE TIER / Renew Free Tier 等关键字） */
-async function waitForDashboard(page, timeout = 15000) {
-  try {
-    await page.waitForFunction(
-      () => {
-        const t = document.body.innerText || '';
-        return /free tier/i.test(t) && /renew free tier|runtime|public url/i.test(t);
-      },
-      { timeout }
-    );
-    return true;
-  } catch (e) {
-    return false;
+/**
+ * 在页面上下文里运行：把导出的 IndexedDB 数据库/表/记录原样写回去
+ * 注意：这个函数会被 Playwright 序列化后直接在浏览器里执行，不能引用外部变量
+ */
+async function restoreIndexedDBInPage(dump) {
+  if (!dump || !dump.length) return { ok: true, restored: 0 };
+  let restored = 0;
+
+  for (const dbMeta of dump) {
+    try {
+      const db = await new Promise((resolve, reject) => {
+        const req = indexedDB.open(dbMeta.name, dbMeta.version);
+        req.onupgradeneeded = (e) => {
+          const database = e.target.result;
+          for (const store of dbMeta.stores) {
+            if (!database.objectStoreNames.contains(store.name)) {
+              const os = database.createObjectStore(store.name, {
+                keyPath: store.keyPath || undefined,
+                autoIncrement: !!store.autoIncrement,
+              });
+              for (const idx of store.indexes || []) {
+                try {
+                  os.createIndex(idx.name, idx.keyPath, { unique: idx.unique, multiEntry: idx.multiEntry });
+                } catch (e) {
+                  /* 索引创建失败忽略 */
+                }
+              }
+            }
+          }
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+        req.onblocked = () => resolve(null);
+      });
+
+      if (!db) continue;
+
+      for (const store of dbMeta.stores) {
+        if (!db.objectStoreNames.contains(store.name)) continue;
+        await new Promise((resolve) => {
+          const tx = db.transaction(store.name, 'readwrite');
+          const os = tx.objectStore(store.name);
+          (store.records || []).forEach((rec) => {
+            try {
+              if (store.keyPath) {
+                os.put(rec.value);
+              } else {
+                os.put(rec.value, rec.key);
+              }
+              restored++;
+            } catch (e) {
+              /* 单条写入失败忽略，不影响整体 */
+            }
+          });
+          tx.oncomplete = resolve;
+          tx.onerror = resolve;
+          tx.onabort = resolve;
+        });
+      }
+      db.close();
+    } catch (e) {
+      /* 某个数据库还原失败，不影响其它数据库 */
+    }
   }
+
+  return { ok: true, restored };
 }
 
 /** 发送 Telegram 通知，可选附带一张图片 */
@@ -159,8 +245,7 @@ async function sendTelegram(text, screenshotPath) {
     process.exit(1);
   }
 
-  // sessionStorage 是我们自定义加进去的字段，标准 Playwright storageState 不认识，要单独摘出来
-  const { sessionStorage: sessionStorageItems, ...storageState } = parsedState;
+  const { sessionStorage: sessionStorageItems, indexedDB: indexedDBDump, ...storageState } = parsedState;
 
   if (!storageState.cookies && !storageState.origins) {
     console.error('MODVC_STATE 缺少 cookies/origins 字段，格式不对');
@@ -168,8 +253,8 @@ async function sendTelegram(text, screenshotPath) {
     process.exit(1);
   }
 
-  // ---- 诊断：检查导出的 token 是否已经过期 ----
-  logJwtExpiryInfo(storageState, sessionStorageItems);
+  console.log(`[调试] IndexedDB 数据库数量: ${Array.isArray(indexedDBDump) ? indexedDBDump.length : 0}`);
+  logTokenDiagnostics(parsedState);
 
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({
@@ -177,7 +262,6 @@ async function sendTelegram(text, screenshotPath) {
     viewport: { width: 1600, height: 1000 },
   });
 
-  // 手动把 sessionStorage 注入到每个新打开的页面里（在脚本运行前执行）
   if (Array.isArray(sessionStorageItems) && sessionStorageItems.length > 0) {
     await context.addInitScript((items) => {
       try {
@@ -192,7 +276,6 @@ async function sendTelegram(text, screenshotPath) {
 
   const page = await context.newPage();
 
-  // ---- 诊断：打印页面自身的 console 输出，以及关键网络请求的状态码 ----
   page.on('console', (msg) => {
     console.log(`[页面console:${msg.type()}] ${msg.text()}`);
   });
@@ -214,14 +297,36 @@ async function sendTelegram(text, screenshotPath) {
   const afterShot = 'after.png';
 
   try {
+    // ---- 第一次打开页面：此时大概率还是未登录状态，主要目的是站到正确的 origin 上 ----
     await page.goto(TARGET_URL, { waitUntil: 'networkidle', timeout: 60000 });
 
-    // ---- 诊断：确认 storageState / sessionStorage 是否真的落地到了页面里 ----
-    const debugStorage = await page.evaluate(() => ({
-      cookie: document.cookie,
-      localStorageKeys: Object.keys(window.localStorage || {}),
-      sessionStorageKeys: Object.keys(window.sessionStorage || {}),
-    }));
+    // ---- 还原 IndexedDB（Firebase 登录态主要存在这里） ----
+    if (Array.isArray(indexedDBDump) && indexedDBDump.length > 0) {
+      const restoreResult = await page.evaluate(restoreIndexedDBInPage, indexedDBDump);
+      console.log('[调试] IndexedDB 还原结果:', JSON.stringify(restoreResult));
+    } else {
+      console.log('[调试] MODVC_STATE 中没有 indexedDB 字段，跳过还原（请确认用的是最新版控制台脚本导出的）');
+    }
+
+    // ---- 重新加载页面，让前端的 Firebase SDK 重新读取 IndexedDB 里刚写入的登录态 ----
+    await page.reload({ waitUntil: 'networkidle', timeout: 60000 });
+
+    // ---- 诊断：确认实际存储情况 ----
+    const debugStorage = await page.evaluate(async () => {
+      let dbNames = [];
+      try {
+        if ('indexedDB' in window && indexedDB.databases) {
+          const dbs = await indexedDB.databases();
+          dbNames = dbs.map((d) => d.name);
+        }
+      } catch (e) {}
+      return {
+        cookie: document.cookie,
+        localStorageKeys: Object.keys(window.localStorage || {}),
+        sessionStorageKeys: Object.keys(window.sessionStorage || {}),
+        indexedDBNames: dbNames,
+      };
+    });
     console.log('[调试] 页面实际看到的存储情况:', JSON.stringify(debugStorage));
 
     // ---- 登录状态有效性检测 ----
@@ -258,14 +363,12 @@ async function sendTelegram(text, screenshotPath) {
     await renewBtn.click();
     await page.waitForTimeout(5000);
 
-    // 部分站点点击后会弹出二次确认框，尝试自动确认
     const confirmBtn = page.locator('button:has-text("Confirm"), button:has-text("OK"), button:has-text("Yes")').first();
     if (await confirmBtn.isVisible().catch(() => false)) {
       await confirmBtn.click();
       await page.waitForTimeout(3000);
     }
 
-    // 刷新页面，确保从服务端拿到最新数据
     await page.reload({ waitUntil: 'networkidle', timeout: 60000 });
 
     const dashboardOkAfter = await waitForDashboard(page);
@@ -280,7 +383,6 @@ async function sendTelegram(text, screenshotPath) {
     await page.screenshot({ path: afterShot, fullPage: true });
     console.log('续期后到期时间:', afterDate);
 
-    // ---- 对比续期前后的到期时间 ----
     let resultMsg;
     if (beforeDate && afterDate) {
       const beforeMs = new Date(beforeDate.replace(/\//g, '-')).getTime();
