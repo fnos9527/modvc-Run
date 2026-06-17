@@ -1,13 +1,18 @@
 /**
  * ModVC (panel.modvc.org) Free Tier 自动续期脚本
  *
+ * 鉴权方式：该站点用的是 localStorage 里存的 JWT（Authorization: Bearer ...），
+ * 不是传统 Cookie Session，所以这里用 Playwright 的 storageState 整体还原登录态
+ * （Cookie + localStorage），并额外手动注入 sessionStorage（标准 storageState 不含）。
+ *
  * 流程：
- * 1. 用 Cookie 编辑器导出的 cookies.txt（Netscape 格式）内容登录
- * 2. 打开 Overview 页面，读取 "FREE TIER until" 的到期时间（续期前）
- * 3. 点击 "Renew Free Tier" 按钮
- * 4. 刷新页面，再次读取到期时间（续期后），对比是否有变化
- * 5. 通过 Telegram 机器人发送结果通知（含截图）
- * 6. 如果 Cookie 已失效（被踢回登录页），立即发送告警通知
+ * 1. 还原登录状态（MODVC_STATE）
+ * 2. 打开 Overview 页面，确认确实进入了仪表盘（而不是被打回首页/登录页）
+ * 3. 读取 "FREE TIER until" 的到期时间（续期前）
+ * 4. 点击 "Renew Free Tier" 按钮
+ * 5. 刷新页面，再次读取到期时间（续期后），对比是否有变化
+ * 6. 通过 Telegram 机器人发送结果通知（含截图）
+ * 7. 如果登录状态已失效（进不去仪表盘），立即发送告警通知
  */
 
 const { chromium } = require('playwright');
@@ -17,51 +22,9 @@ const TARGET_URL = 'https://panel.modvc.org/#pricing';
 
 const TG_TOKEN = process.env.TG_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
-const COOKIES_RAW = process.env.MODVC_COOKIES;
+const STATE_RAW = process.env.MODVC_STATE;
 
 // ------------------------- 工具函数 -------------------------
-
-/**
- * 解析 Netscape 格式 cookies.txt 内容为 Playwright 可用的 cookie 数组
- * 每行格式：domain \t includeSubdomains \t path \t secure \t expiry \t name \t value
- */
-function parseNetscapeCookies(raw) {
-  const cookies = [];
-  const lines = raw.split('\n');
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue; // 跳过空行/注释行
-
-    const parts = trimmed.split('\t');
-    if (parts.length < 7) continue;
-
-    let domain = parts[0];
-    const includeSub = parts[1];
-    const cpath = parts[2] || '/';
-    const secure = parts[3];
-    const expiry = parts[4];
-    const name = parts[5];
-    const value = parts.slice(6).join('\t'); // 防止 value 里也含 tab
-
-    if (includeSub && includeSub.toUpperCase() === 'TRUE' && !domain.startsWith('.')) {
-      domain = '.' + domain;
-    }
-
-    const expiryNum = parseInt(expiry, 10);
-
-    cookies.push({
-      name,
-      value,
-      domain,
-      path: cpath,
-      secure: (secure || '').toUpperCase() === 'TRUE',
-      expires: Number.isFinite(expiryNum) && expiryNum > 0 ? expiryNum : -1,
-    });
-  }
-
-  return cookies;
-}
 
 /** 从页面正文中提取 "FREE TIER until xxxx/x/x" 这样的日期 */
 async function extractUntilDate(page) {
@@ -71,7 +34,7 @@ async function extractUntilDate(page) {
   let match = text.match(/until\s*\n?\s*(\d{4}\/\d{1,2}\/\d{1,2})/i);
   if (match) return match[1];
 
-  // 兜底：在 "FREE TIER" 附近 100 字符内找日期
+  // 兜底：在 "FREE TIER" 附近 120 字符内找日期
   const idx = text.toUpperCase().indexOf('FREE TIER');
   if (idx !== -1) {
     const snippet = text.slice(idx, idx + 120);
@@ -82,12 +45,20 @@ async function extractUntilDate(page) {
   return null;
 }
 
-/** 粗略判断是否被踢回了登录页（Cookie 失效） */
-function isLoggedOut(text) {
-  const lower = text.toLowerCase();
-  const hasLoginHint = /sign in|log in|forgot password|email address/.test(lower) && /password/.test(lower);
-  const hasDashboardHint = /overview|free tier|renew free tier|public url/i.test(text);
-  return hasLoginHint && !hasDashboardHint;
+/** 等待仪表盘真正加载出来（看到 FREE TIER / Renew Free Tier 等关键字） */
+async function waitForDashboard(page, timeout = 15000) {
+  try {
+    await page.waitForFunction(
+      () => {
+        const t = document.body.innerText || '';
+        return /free tier/i.test(t) && /renew free tier|runtime|public url/i.test(t);
+      },
+      { timeout }
+    );
+    return true;
+  } catch (e) {
+    return false;
+  }
 }
 
 /** 发送 Telegram 通知，可选附带一张图片 */
@@ -128,38 +99,64 @@ async function sendTelegram(text, screenshotPath) {
 // ------------------------- 主流程 -------------------------
 
 (async () => {
-  if (!COOKIES_RAW) {
-    console.error('未配置 MODVC_COOKIES Secret');
-    await sendTelegram('❌ ModVC 续期失败：未配置 MODVC_COOKIES Secret，请先导出 Cookie 并添加到 GitHub Secrets。');
+  if (!STATE_RAW) {
+    console.error('未配置 MODVC_STATE Secret');
+    await sendTelegram('❌ ModVC 续期失败：未配置 MODVC_STATE Secret，请先按说明导出登录状态并添加到 GitHub Secrets。');
     process.exit(1);
   }
 
-  const cookies = parseNetscapeCookies(COOKIES_RAW);
-  if (cookies.length === 0) {
-    console.error('Cookie 解析为空');
-    await sendTelegram('❌ ModVC 续期失败：MODVC_COOKIES 内容解析为空，请检查是否为 Netscape 格式（Tab 分隔）的 cookies.txt 原文。');
+  let parsedState;
+  try {
+    parsedState = JSON.parse(STATE_RAW);
+  } catch (e) {
+    console.error('MODVC_STATE 不是合法 JSON:', e.message);
+    await sendTelegram('❌ ModVC 续期失败：MODVC_STATE 内容不是合法 JSON，请检查是否完整复制了控制台脚本输出的内容。');
+    process.exit(1);
+  }
+
+  // sessionStorage 是我们自定义加进去的字段，标准 Playwright storageState 不认识，要单独摘出来
+  const { sessionStorage: sessionStorageItems, ...storageState } = parsedState;
+
+  if (!storageState.cookies && !storageState.origins) {
+    console.error('MODVC_STATE 缺少 cookies/origins 字段，格式不对');
+    await sendTelegram('❌ ModVC 续期失败：MODVC_STATE 缺少 cookies/origins 字段，请重新用控制台脚本导出。');
     process.exit(1);
   }
 
   const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({ viewport: { width: 1600, height: 1000 } });
-  await context.addCookies(cookies);
+  const context = await browser.newContext({
+    storageState,
+    viewport: { width: 1600, height: 1000 },
+  });
+
+  // 手动把 sessionStorage 注入到每个新打开的页面里（在脚本运行前执行）
+  if (Array.isArray(sessionStorageItems) && sessionStorageItems.length > 0) {
+    await context.addInitScript((items) => {
+      try {
+        items.forEach(({ name, value }) => {
+          window.sessionStorage.setItem(name, value);
+        });
+      } catch (e) {
+        /* 忽略注入失败 */
+      }
+    }, sessionStorageItems);
+  }
+
   const page = await context.newPage();
 
-  let beforeShot = 'before.png';
-  let afterShot = 'after.png';
+  const beforeShot = 'before.png';
+  const afterShot = 'after.png';
 
   try {
     await page.goto(TARGET_URL, { waitUntil: 'networkidle', timeout: 60000 });
-    await page.waitForTimeout(3000);
 
-    let bodyText = await page.evaluate(() => document.body.innerText);
-
-    // ---- Cookie 失效检测 ----
-    if (isLoggedOut(bodyText)) {
+    // ---- 登录状态有效性检测 ----
+    const dashboardOk = await waitForDashboard(page);
+    if (!dashboardOk) {
       await page.screenshot({ path: beforeShot, fullPage: true });
       await sendTelegram(
-        '⚠️ ModVC Cookie 已失效！页面被重定向到登录页，自动续期未执行。\n请重新登录 panel.modvc.org，用 Cookie 编辑器重新导出 cookies.txt，并更新 GitHub Secret：MODVC_COOKIES。',
+        '⚠️ ModVC 登录状态已失效！打开页面后没能看到仪表盘内容（FREE TIER / Renew Free Tier），自动续期未执行。\n' +
+          '请重新登录 panel.modvc.org，用控制台脚本重新导出登录状态，并更新 GitHub Secret：MODVC_STATE。',
         beforeShot
       );
       await browser.close();
@@ -196,12 +193,11 @@ async function sendTelegram(text, screenshotPath) {
 
     // 刷新页面，确保从服务端拿到最新数据
     await page.reload({ waitUntil: 'networkidle', timeout: 60000 });
-    await page.waitForTimeout(3000);
 
-    bodyText = await page.evaluate(() => document.body.innerText);
-    if (isLoggedOut(bodyText)) {
+    const dashboardOkAfter = await waitForDashboard(page);
+    if (!dashboardOkAfter) {
       await page.screenshot({ path: afterShot, fullPage: true });
-      await sendTelegram('⚠️ ModVC 点击续期后 Cookie 失效（被踢回登录页），请重新更新 MODVC_COOKIES。', afterShot);
+      await sendTelegram('⚠️ ModVC 点击续期后登录状态失效（进不去仪表盘），请重新导出并更新 MODVC_STATE。', afterShot);
       await browser.close();
       process.exit(1);
     }
