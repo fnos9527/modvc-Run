@@ -223,19 +223,33 @@ async function restoreIndexedDBInPage(dump) {
   return { ok: true, restored };
 }
 
-/** 发送 Telegram 通知，可选附带一张图片 */
+/** 发送 Telegram 通知，可选附带一张图片（caption 上限 1024 字符，超长会自动截断并补发完整文字） */
 async function sendTelegram(text, screenshotPath) {
   if (!TG_TOKEN || !TG_CHAT_ID) {
     console.log('[TG] 未配置 TG_TOKEN / TG_CHAT_ID，跳过通知。消息内容：\n' + text);
     return;
   }
 
+  const sendText = async (msg) => {
+    const res = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: TG_CHAT_ID, text: msg.slice(0, 4000) }),
+    });
+    const json = await res.json();
+    if (!json.ok) console.error('[TG] 发送消息失败:', json);
+    return json.ok;
+  };
+
   try {
     if (screenshotPath && fs.existsSync(screenshotPath)) {
+      const CAPTION_LIMIT = 1000;
+      const caption = text.length > CAPTION_LIMIT ? text.slice(0, CAPTION_LIMIT - 1) + '…' : text;
+
       const buffer = fs.readFileSync(screenshotPath);
       const form = new FormData();
       form.append('chat_id', TG_CHAT_ID);
-      form.append('caption', text);
+      form.append('caption', caption);
       form.append('photo', new Blob([buffer]), 'screenshot.png');
 
       const res = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendPhoto`, {
@@ -243,19 +257,88 @@ async function sendTelegram(text, screenshotPath) {
         body: form,
       });
       const json = await res.json();
-      if (!json.ok) console.error('[TG] 发送图片失败:', json);
+      if (!json.ok) {
+        console.error('[TG] 发送图片失败:', json);
+        await sendText(text); // 图片失败就退回纯文字
+      } else if (text.length > CAPTION_LIMIT) {
+        await sendText(text); // 文字被截断了，补发完整版
+      }
     } else {
-      const res = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: TG_CHAT_ID, text }),
-      });
-      const json = await res.json();
-      if (!json.ok) console.error('[TG] 发送消息失败:', json);
+      await sendText(text);
     }
   } catch (e) {
     console.error('[TG] 通知发送异常:', e.message);
   }
+}
+
+/**
+ * 关闭站点上各种遮挡页面的弹窗（例如 "What's New" 公告弹窗）。
+ * 策略：
+ *   1. 找到全屏遮罩层(fixed inset-0)里的 Close / Got it / Dismiss / 关闭 按钮并点击
+ *   2. 按 Escape
+ *   3. 实在关不掉，直接用 JS 把遮罩层从 DOM 里移除
+ * 返回处理了多少个弹窗。
+ */
+async function dismissPopups(page, label = '') {
+  let handled = 0;
+
+  // 弹窗是带动画渐入的，稍微等一下让它有机会出现
+  await page.waitForTimeout(1500);
+
+  for (let round = 0; round < 5; round++) {
+    const overlay = page.locator('div.fixed.inset-0').first();
+    const hasOverlay = await overlay.isVisible().catch(() => false);
+    if (!hasOverlay) break;
+
+    console.log(`[弹窗${label}] 检测到遮罩层，第 ${round + 1} 次尝试关闭`);
+
+    // 方式 1：点遮罩层里的关闭按钮（优先精确匹配 Close，避免误点 "Open Settings"）
+    const closeBtn = page
+      .locator('div.fixed.inset-0')
+      .getByRole('button', { name: /^\s*(close|got it|dismiss|maybe later|not now|skip|关闭|知道了)\s*$/i })
+      .first();
+
+    let closed = false;
+    if (await closeBtn.isVisible().catch(() => false)) {
+      try {
+        await closeBtn.click({ timeout: 3000 });
+        closed = true;
+        console.log(`[弹窗${label}] 已点击关闭按钮`);
+      } catch (e) {
+        console.log(`[弹窗${label}] 点击关闭按钮失败: ${e.message.split('\n')[0]}`);
+      }
+    }
+
+    // 方式 2：Escape
+    if (!closed) {
+      await page.keyboard.press('Escape').catch(() => {});
+    }
+    await page.waitForTimeout(600);
+
+    // 方式 3：还在的话，强制从 DOM 里删掉
+    const stillThere = await page.locator('div.fixed.inset-0').first().isVisible().catch(() => false);
+    if (stillThere && round >= 2) {
+      const removed = await page.evaluate(() => {
+        let n = 0;
+        document.querySelectorAll('div.fixed.inset-0').forEach((el) => {
+          const z = getComputedStyle(el).zIndex;
+          // 只删高层级的全屏遮罩（z-[70] 之类的弹窗），不动普通布局元素
+          if (parseInt(z, 10) >= 50) {
+            el.remove();
+            n++;
+          }
+        });
+        return n;
+      });
+      console.log(`[弹窗${label}] 强制移除遮罩层 ${removed} 个`);
+    }
+
+    handled++;
+    await page.waitForTimeout(400);
+  }
+
+  if (handled === 0) console.log(`[弹窗${label}] 没有发现弹窗`);
+  return handled;
 }
 
 function formatDate(d) {
@@ -377,6 +460,9 @@ function formatDate(d) {
     // 给响应监听器一点缓冲时间，确保 /tier 等请求的回调已经处理完
     await page.waitForTimeout(1500);
 
+    // 关掉 "What's New" 等公告弹窗，否则它会挡住后面的按钮点击
+    await dismissPopups(page, '-续期前');
+
     const beforeApiInfo = pickExpiryDate([latestTierJson, latestOrdersJson]);
     const beforeTextDate = await extractUntilDateFromText(page);
     console.log(
@@ -400,7 +486,22 @@ function formatDate(d) {
       process.exit(0);
     }
 
-    await renewBtn.click();
+    // 点击前再确认一次没有弹窗；点击失败时再清一次弹窗并重试，最后用 force/JS 兜底
+    await dismissPopups(page, '-点击前');
+    try {
+      await renewBtn.click({ timeout: 10000 });
+    } catch (e) {
+      console.log('[续期] 常规点击失败，清理弹窗后重试:', e.message.split('\n')[0]);
+      await dismissPopups(page, '-重试');
+      try {
+        await renewBtn.click({ timeout: 10000 });
+      } catch (e2) {
+        console.log('[续期] 重试仍失败，改用 force 点击:', e2.message.split('\n')[0]);
+        await renewBtn.click({ force: true, timeout: 10000 }).catch(async () => {
+          await renewBtn.evaluate((el) => el.click());
+        });
+      }
+    }
     await page.waitForTimeout(5000);
 
     const confirmBtn = page.locator('button:has-text("Confirm"), button:has-text("OK"), button:has-text("Yes")').first();
@@ -420,6 +521,7 @@ function formatDate(d) {
     }
 
     await page.waitForTimeout(1500);
+    await dismissPopups(page, '-续期后');
 
     const afterApiInfo = pickExpiryDate([latestTierJson, latestOrdersJson]);
     const afterTextDate = await extractUntilDateFromText(page);
@@ -462,7 +564,7 @@ function formatDate(d) {
       await page.screenshot({ path: 'error.png', fullPage: true });
     } catch (_) {}
     await sendTelegram(
-      `❌ ModVC 续期脚本执行异常：${err.message}`,
+      `❌ ModVC 续期脚本执行异常：${String(err.message).split('\n')[0]}`,
       fs.existsSync('error.png') ? 'error.png' : undefined
     );
     process.exitCode = 1;
