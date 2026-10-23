@@ -1,15 +1,23 @@
 /**
  * ModVC (panel.modvc.org) Free Tier 自动续期脚本
  *
+ * 【本次修复】
+ * 原脚本使用 waitUntil: 'networkidle'。panel.modvc.org 页面内嵌的 Pocketsflow / Whop /
+ * hCaptcha 支付弹窗脚本（2026-10-14 更新后）会持续发请求并反复重试(429/404/401)，
+ * 页面永远不会"网络空闲"，导致 page.goto 60 秒超时。
+ *
+ * 修复方式：
+ *   1. 所有 goto / reload 改为 waitUntil: 'domcontentloaded' + 自动重试(3次)
+ *   2. 再"尽力"等一下 load / networkidle，但超时只忽略，不报错
+ *   3. 屏蔽 pocketsflow / whop / basistheory 等与续期无关的支付第三方请求，减少干扰
+ *   4. 过滤页面 console 里的噪音日志
+ *   5. 仪表盘等待时间从 15 秒加长到 30 秒
+ *
  * 鉴权方式：站点用 Google 账号登录（Firebase Auth），登录态主要存放在浏览器的
  * IndexedDB 里。所以这里：
  *   1. 用 Playwright storageState 还原 Cookie + localStorage
  *   2. 手动把 sessionStorage 写回去
- *   3. 手动把 IndexedDB 的数据库/表/记录原样写回去（这是关键，已验证有效）
- *
- * 到期时间不再从页面文字里抠（页面布局容易变化、不可靠），改为直接抓
- * /tier、/hosting/orders 这两个接口返回的 JSON，在里面自动找形如
- * expiresAt / until / renewUntil 这类字段。
+ *   3. 手动把 IndexedDB 的数据库/表/记录原样写回去
  *
  * 流程：
  * 1. 还原登录状态（MODVC_STATE）
@@ -30,7 +38,36 @@ const TG_TOKEN = process.env.TG_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
 const STATE_RAW = process.env.MODVC_STATE;
 
+// 设为 'false' 可关闭对第三方支付脚本的屏蔽（默认开启）
+const BLOCK_THIRD_PARTY = process.env.BLOCK_THIRD_PARTY !== 'false';
+
 // ------------------------- 工具函数 -------------------------
+
+/**
+ * 稳健的页面导航：不依赖 networkidle。
+ * mode = 'goto' | 'reload'
+ */
+async function navigate(page, mode, url, tries = 3) {
+  let lastErr;
+  for (let i = 1; i <= tries; i++) {
+    try {
+      if (mode === 'goto') {
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      } else {
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 });
+      }
+      // 尽力等一下 load 和网络安静，超时直接忽略（该页面有持续请求，不能强求）
+      await page.waitForLoadState('load', { timeout: 20000 }).catch(() => {});
+      await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+      return;
+    } catch (e) {
+      lastErr = e;
+      console.log(`[导航] ${mode} 第 ${i}/${tries} 次失败: ${String(e.message).split('\n')[0]}`);
+      if (i < tries) await page.waitForTimeout(5000);
+    }
+  }
+  throw lastErr;
+}
 
 /** 从页面正文里提取 "FREE TIER until xxxx/x/x" 这样的日期，仅作为兜底参考 */
 async function extractUntilDateFromText(page) {
@@ -50,7 +87,7 @@ async function extractUntilDateFromText(page) {
 }
 
 /** 等待仪表盘真正加载出来 */
-async function waitForDashboard(page, timeout = 15000) {
+async function waitForDashboard(page, timeout = 30000) {
   try {
     await page.waitForFunction(
       () => {
@@ -346,6 +383,10 @@ function formatDate(d) {
   return d.toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
 }
 
+// 页面 console 里这些都是第三方支付/验证码组件的噪音，不打印
+const NOISE_RE =
+  /Permissions policy violation|devicemotion|deviceorientation|postMessage|No available adapters|GL Driver Message|allowpaymentrequest|Failed to load resource|EvalError|hcaptcha\.com|^\s*$/i;
+
 // ------------------------- 主流程 -------------------------
 
 (async () => {
@@ -381,6 +422,13 @@ function formatDate(d) {
     viewport: { width: 1600, height: 1000 },
   });
 
+  // 屏蔽与续期无关的支付第三方（它们会持续发请求并 429 重试，拖垮页面加载）
+  // 注意：只屏蔽这几个域名，modvc 自己的接口不受影响
+  if (BLOCK_THIRD_PARTY) {
+    await context.route(/(pocketsflow\.com|whop\.com|basistheory\.com|hcaptcha\.com)/i, (route) => route.abort());
+    console.log('[调试] 已屏蔽第三方支付/验证码脚本 (pocketsflow / whop / basistheory / hcaptcha)');
+  }
+
   if (Array.isArray(sessionStorageItems) && sessionStorageItems.length > 0) {
     await context.addInitScript((items) => {
       try {
@@ -398,7 +446,9 @@ function formatDate(d) {
   let latestOrdersJson = null;
 
   page.on('console', (msg) => {
-    console.log(`[页面console:${msg.type()}] ${msg.text()}`);
+    const text = msg.text();
+    if (NOISE_RE.test(text)) return;
+    console.log(`[页面console:${msg.type()}] ${text}`);
   });
 
   page.on('response', async (response) => {
@@ -434,7 +484,9 @@ function formatDate(d) {
   const afterShot = 'after.png';
 
   try {
-    await page.goto(TARGET_URL, { waitUntil: 'networkidle', timeout: 60000 });
+    await navigate(page, 'goto', TARGET_URL);
+    // 给前端框架（Firebase 等）初始化留一点时间，再写 IndexedDB
+    await page.waitForTimeout(3000);
 
     if (Array.isArray(indexedDBDump) && indexedDBDump.length > 0) {
       const restoreResult = await page.evaluate(restoreIndexedDBInPage, indexedDBDump);
@@ -443,7 +495,7 @@ function formatDate(d) {
       console.log('[调试] MODVC_STATE 中没有 indexedDB 字段，跳过还原');
     }
 
-    await page.reload({ waitUntil: 'networkidle', timeout: 60000 });
+    await navigate(page, 'reload');
 
     const dashboardOk = await waitForDashboard(page);
     if (!dashboardOk) {
@@ -510,7 +562,7 @@ function formatDate(d) {
       await page.waitForTimeout(3000);
     }
 
-    await page.reload({ waitUntil: 'networkidle', timeout: 60000 });
+    await navigate(page, 'reload');
 
     const dashboardOkAfter = await waitForDashboard(page);
     if (!dashboardOkAfter) {
