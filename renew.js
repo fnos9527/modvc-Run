@@ -1,7 +1,16 @@
 /**
  * ModVC (panel.modvc.org) Free Tier 自动续期脚本
  *
- * 【本次修复】
+ * 【最新修复 2026-10-30】
+ * 站点新增了 "Pay with Card & Auto-Renew" 全屏弹窗（按钮：Upgrade to Pro / Dismiss），
+ * 它出现在「等待仪表盘」阶段，旧脚本在弹窗被关闭之前就判定登录失效并退出。
+ * 现在：
+ *   1. 页面一加载就注入一个后台监视器，只要出现文字恰好为 "Dismiss" 的按钮就自动点击
+ *   2. waitForDashboard 轮询时，每一轮都会先清弹窗(优先点 Dismiss，绝不点 Upgrade)
+ *   3. dismissPopups 不再依赖 div.fixed.inset-0，页面任何位置的 Dismiss 按钮都会被点掉
+ *   4. 判定失败时会把页面文字打印到日志，方便排查
+ *
+ * 【上一次修复】
  * 原脚本使用 waitUntil: 'networkidle'。panel.modvc.org 页面内嵌的 Pocketsflow / Whop /
  * hCaptcha 支付弹窗脚本（2026-10-14 更新后）会持续发请求并反复重试(429/404/401)，
  * 页面永远不会"网络空闲"，导致 page.goto 60 秒超时。
@@ -86,20 +95,30 @@ async function extractUntilDateFromText(page) {
   return null;
 }
 
-/** 等待仪表盘真正加载出来 */
-async function waitForDashboard(page, timeout = 30000) {
-  try {
-    await page.waitForFunction(
-      () => {
+/** 等待仪表盘真正加载出来（轮询期间会不断清理弹窗，避免被弹窗挡住） */
+async function waitForDashboard(page, timeout = 45000) {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    // 先清弹窗（不额外等待，轮询本身就是间隔）
+    await dismissPopups(page, '-等待仪表盘', { initialWait: 0 }).catch(() => {});
+
+    const ok = await page
+      .evaluate(() => {
         const t = document.body.innerText || '';
         return /free tier/i.test(t) && /renew free tier|runtime|public url/i.test(t);
-      },
-      { timeout }
-    );
-    return true;
-  } catch (e) {
-    return false;
+      })
+      .catch(() => false);
+    if (ok) return true;
+
+    await page.waitForTimeout(1500);
   }
+
+  // 失败时打印页面文字，方便排查到底看到了什么
+  try {
+    const txt = await page.evaluate(() => (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 600));
+    console.log('[调试] 仪表盘判定失败，当前页面文字(前600字):', txt);
+  } catch (e) {}
+  return false;
 }
 
 /** 尝试 base64url 解码 JWT 的 payload 部分 */
@@ -308,52 +327,83 @@ async function sendTelegram(text, screenshotPath) {
   }
 }
 
-/**
- * 关闭站点上各种遮挡页面的弹窗（例如 "What's New" 公告弹窗）。
- * 策略：
- *   1. 找到全屏遮罩层(fixed inset-0)里的 Close / Got it / Dismiss / 关闭 按钮并点击
- *   2. 按 Escape
- *   3. 实在关不掉，直接用 JS 把遮罩层从 DOM 里移除
- * 返回处理了多少个弹窗。
- */
-async function dismissPopups(page, label = '') {
-  let handled = 0;
-
-  // 弹窗是带动画渐入的，稍微等一下让它有机会出现
-  await page.waitForTimeout(1500);
-
-  for (let round = 0; round < 5; round++) {
-    const overlay = page.locator('div.fixed.inset-0').first();
-    const hasOverlay = await overlay.isVisible().catch(() => false);
-    if (!hasOverlay) break;
-
-    console.log(`[弹窗${label}] 检测到遮罩层，第 ${round + 1} 次尝试关闭`);
-
-    // 方式 1：点遮罩层里的关闭按钮（优先精确匹配 Close，避免误点 "Open Settings"）
-    const closeBtn = page
-      .locator('div.fixed.inset-0')
-      .getByRole('button', { name: /^\s*(close|got it|dismiss|maybe later|not now|skip|关闭|知道了)\s*$/i })
-      .first();
-
-    let closed = false;
-    if (await closeBtn.isVisible().catch(() => false)) {
+/** 点击 locator 匹配到的第一个可见元素；常规点击失败 -> force -> JS click */
+async function clickFirstVisible(locator) {
+  const n = await locator.count().catch(() => 0);
+  for (let i = 0; i < n; i++) {
+    const el = locator.nth(i);
+    if (!(await el.isVisible().catch(() => false))) continue;
+    try {
+      await el.click({ timeout: 3000 });
+      return true;
+    } catch (e) {
       try {
-        await closeBtn.click({ timeout: 3000 });
-        closed = true;
-        console.log(`[弹窗${label}] 已点击关闭按钮`);
-      } catch (e) {
-        console.log(`[弹窗${label}] 点击关闭按钮失败: ${e.message.split('\n')[0]}`);
+        await el.click({ force: true, timeout: 2000 });
+        return true;
+      } catch (e2) {
+        const ok = await el.evaluate((x) => { x.click(); return true; }).catch(() => false);
+        if (ok) return true;
       }
     }
+  }
+  return false;
+}
 
-    // 方式 2：Escape
+// 只点这个词的按钮：页面任何位置都点（例如 "Pay with Card & Auto-Renew" 弹窗里的 Dismiss）
+const DISMISS_PRIMARY_RE = /^\s*dismiss\s*$/i;
+// 这些词只在遮罩层/对话框里才点，避免误点页面上正常的按钮
+const DISMISS_OTHER_RE = /^\s*(close|got it|maybe later|not now|skip|no thanks|关闭|知道了|我知道了)\s*$/i;
+const OVERLAY_SELECTOR = 'div.fixed.inset-0, [role="dialog"], [aria-modal="true"]';
+
+/**
+ * 关闭站点上各种遮挡页面的弹窗（"What's New"、"Pay with Card & Auto-Renew" 等）。
+ * 策略：
+ *   1. 优先点击 "Dismiss" 按钮（页面任何位置）。绝不会点 "Upgrade to Pro"
+ *   2. 遮罩层里的 Close / Got it / Maybe later 等按钮
+ *   3. 按 Escape
+ *   4. 实在关不掉，直接用 JS 把高层级全屏遮罩从 DOM 里移除
+ * 返回处理了多少个弹窗。
+ * options.initialWait：开始前等待毫秒数（弹窗有渐入动画，默认等 1500ms）
+ */
+async function dismissPopups(page, label = '', { initialWait = 1500 } = {}) {
+  let handled = 0;
+
+  if (initialWait > 0) await page.waitForTimeout(initialWait);
+
+  for (let round = 0; round < 6; round++) {
+    // 方式 1：Dismiss 按钮（getByRole 找不到就按文字再找一遍）
+    let closed = await clickFirstVisible(page.getByRole('button', { name: DISMISS_PRIMARY_RE }));
     if (!closed) {
-      await page.keyboard.press('Escape').catch(() => {});
+      closed = await clickFirstVisible(page.locator('button, [role="button"]').filter({ hasText: DISMISS_PRIMARY_RE }));
     }
+    if (closed) {
+      handled++;
+      console.log(`[弹窗${label}] 已点击 Dismiss 按钮`);
+      await page.waitForTimeout(800);
+      continue;
+    }
+
+    // 方式 2：遮罩层/对话框里的其它关闭按钮
+    closed = await clickFirstVisible(page.locator(OVERLAY_SELECTOR).getByRole('button', { name: DISMISS_OTHER_RE }));
+    if (closed) {
+      handled++;
+      console.log(`[弹窗${label}] 已点击关闭按钮`);
+      await page.waitForTimeout(800);
+      continue;
+    }
+
+    // 没有可点的按钮：看看是不是还有遮罩层
+    const hasOverlay = await page.locator(OVERLAY_SELECTOR).first().isVisible().catch(() => false);
+    if (!hasOverlay) break;
+
+    console.log(`[弹窗${label}] 检测到遮罩层但没有关闭按钮，第 ${round + 1} 次尝试 Escape / 移除`);
+
+    // 方式 3：Escape
+    await page.keyboard.press('Escape').catch(() => {});
     await page.waitForTimeout(600);
 
-    // 方式 3：还在的话，强制从 DOM 里删掉
-    const stillThere = await page.locator('div.fixed.inset-0').first().isVisible().catch(() => false);
+    // 方式 4：还在的话，强制从 DOM 里删掉
+    const stillThere = await page.locator(OVERLAY_SELECTOR).first().isVisible().catch(() => false);
     if (stillThere && round >= 2) {
       const removed = await page.evaluate(() => {
         let n = 0;
@@ -428,6 +478,21 @@ const NOISE_RE =
     await context.route(/(pocketsflow\.com|whop\.com|basistheory\.com|hcaptcha\.com)/i, (route) => route.abort());
     console.log('[调试] 已屏蔽第三方支付/验证码脚本 (pocketsflow / whop / basistheory / hcaptcha)');
   }
+
+  // 后台监视器：每次页面加载(含 reload)都会注入。只要出现文字恰好是 "Dismiss" 的可见按钮就点掉，
+  // 这样即使弹窗在脚本做别的事情时才弹出来，也不会一直挡住页面。
+  await context.addInitScript(() => {
+    const tick = () => {
+      try {
+        document.querySelectorAll('button, [role="button"]').forEach((b) => {
+          if (/^\s*dismiss\s*$/i.test(b.textContent || '') && b.getClientRects().length > 0) {
+            b.click();
+          }
+        });
+      } catch (e) {}
+    };
+    setInterval(tick, 500);
+  });
 
   if (Array.isArray(sessionStorageItems) && sessionStorageItems.length > 0) {
     await context.addInitScript((items) => {
